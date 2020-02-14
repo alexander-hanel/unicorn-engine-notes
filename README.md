@@ -314,7 +314,7 @@ The following hooks do not contain example code but the previous examples can be
 ### Instrument User-Defined Callbacks
 Instrument callbacks are used to read, write or control the flow of the instrumentation. The Memory and Hook Management section contained a number of example user callbacks. 
 
-### Uniconn Initialization Class
+### Unicorn Initialization Class
 The following class can be used to initialize memory (code, data, stack, etc) before using Unicorn. It is designed for the x86/x86_64 code or executables. It relies on PEFile to load the executable. An example on how to use the code can be found in Usage Example. 
 
 ```python
