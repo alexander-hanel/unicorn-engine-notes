@@ -314,10 +314,193 @@ The following hooks do not contain example code but the previous examples can be
 ### Instrument User-Defined Callbacks
 Instrument callbacks are used to read, write or control the flow of the instrumentation. The Memory and Hook Management section contained a number of example user callbacks. 
 
-###### Example X
-```python
+### Uniconn Initialization Class
+The following class can be used to initialize memory (code, data, stack, etc) before using Unicorn. It is designed for the x86/x86_64 code or executables. It relies on PEFile to load the executable. If 
 
+```python
+from __future__ import print_function
+import pefile, collections
+from unicorn import *
+from unicorn.x86_const import *
+
+IMAGE_FILE_MACHINE_I386 = 0x014c
+IMAGE_FILE_MACHINE_AMD64 = 0x8664
+
+"""
+    Usage Example: 
+        # run shellcode 
+        # read bytes 
+        instructions = b"\x90\x90\x90\x90""
+        # init unicorn instance, allocate memory, create stack, etc 
+        tt = InitUnicorn(instructions)
+        # emulate code standard unicorn start arguments
+        tt.mu.emu_start(tt.code_base, tt.code_base + len(instructions))
+        # read register value 
+        r_eip = tt.mu.reg_read(UC_X86_REG_EIP)
+        print("0x%x" % r_eip)
+        
+        # read 32-bit executable 
+        data = open("bad_file.exe", "rb").read()
+        # options data, type_pe=False, bit=32, debug=False)
+        tt = InitUnicorn(data, type_pe=True, debug=True)
+        
+        try:
+            # Verbose, if it works set DEBUG False 
+            tt.DEBUG = True
+            # emulate virtual address 
+            tt.mu.emu_start(0x0405490, 0x0405490 + 0x1C)
+            r_eax = tt.mu.reg_read(UC_X86_REG_EAX)
+            print("0x%x" % r_eax)
+        
+        except Exception as e:
+            print("0x%x" % (tt.mu.reg_read(UC_X86_REG_ESP)))
+            print(e)
+"""
+
+
+class InitUnicorn(object):
+    def __init__(self, data, type_pe=False, bit=32, debug=False):
+        self.code_base = 0x00100000
+        self.DEBUG = debug
+        # pe check
+        if type_pe:
+            self.load_pe(data)
+            if self.pe:
+                self.init_unicorn()
+                self.base = self.pe.OPTIONAL_HEADER.ImageBase
+                self.map_pe_mem()
+                self.create_stack()
+        else:
+            if bit == 32:
+                self.is_x86_machine = True
+            else:
+                self.is_x86_machine = False
+            self.init_unicorn()
+            self.map_data(data)
+            self.create_stack()
+        if self.DEBUG:
+            self.add_debug()
+
+    def create_stack(self):
+        if self.is_x86_machine:
+            self.is_x86_machine = True
+            self.stack_base = 0x00300000
+            self.stack_size = 0x00100000
+        else:
+            self.is_x86_machine = False
+            self.stack_base = 0xffffffff00000000
+            self.stack_size = 0x0000000000100000
+        self.mu.mem_map(self.stack_base, self.stack_size)
+        self.mu.mem_write(self.stack_base, b"\x00" * self.stack_size)
+        if self.is_x86_machine:
+            self.mu.reg_write(UC_X86_REG_ESP, self.stack_base + 0x800)
+            self.mu.reg_write(UC_X86_REG_EBP, self.stack_base + 0x1000)
+        else:
+            self.mu.reg_write(UC_X86_REG_RSP, self.stack_base + 0x8000)
+            self.mu.reg_write(UC_X86_REG_RBP, self.stack_base + 0x10000)
+
+    def init_unicorn(self):
+        if self.is_x86_machine:
+            self.mu = Uc(UC_ARCH_X86, UC_MODE_32)
+        else:
+            self.mu = Uc(UC_ARCH_X86, UC_MODE_64)
+
+    def map_data(self, data):
+        self.mu.mem_map(self.code_base, 0x10000)
+        self.mu.mem_write(self.code_base, data)
+
+    '''
+    Modified version of Willi Ballenthin's code
+        https://github.com/williballenthin/python-vb/blob/master/vb/analyzer.py#L115
+    '''
+    def load_pe(self, pe_data):
+        try:
+            self.pe = pefile.PE(data=pe_data)
+            if self.pe.FILE_HEADER.Machine == IMAGE_FILE_MACHINE_I386:
+                self.is_x86_machine = True
+            elif self.pe.FILE_HEADER.Machine == IMAGE_FILE_MACHINE_AMD64:
+                self.is_x86_machine = False
+
+        except Exception as e:
+            self.pe = None
+            if self.DEBUG:
+                print("ERROR: pefile load error %s") % (e)
+            return
+
+    def map_pe_mem(self):
+        # map executable memory
+        align_size = self.pe.OPTIONAL_HEADER.SectionAlignment
+        for section in self.get_map():
+            self.mu.mem_map(section.va, self.align(section.size, align_size))
+            temp_bytes = self.get_bytes(section.va, section.size)
+            self.mu.mem_write(section.va, temp_bytes)
+
+    def get_map(self):
+        MapEntry = collections.namedtuple('MapEntry', ['va', 'size'])
+        ret = []
+        for section in self.pe.sections:
+            rva = section.VirtualAddress
+            va = self.base + rva
+            size = section.Misc_VirtualSize
+            ret.append(MapEntry(va, size))
+        return ret
+
+    def get_bytes(self, va, length):
+        rva = va - self.base
+        return self.pe.get_data(rva, length)
+
+    def va(self, rva):
+        return self.base + rva
+
+    def rva(self, va):
+        return va - self.base
+
+    def align(self, value, alignment):
+        if value % alignment == 0:
+            return value
+        return value + (alignment - (value % alignment))
+
+    def add_debug(self):
+     """For Debugging Use Only"""
+        self.mu.hook_add(UC_HOOK_CODE, self.hook_code)
+        self.mu.hook_add(UC_HOOK_INSN, self.hook_call, None, 1, 0, UC_X86_INS_CALL)
+        self.mu.hook_add(UC_HOOK_MEM_INVALID, self.hook_mem_invalid)
+
+    def hook_code(self, uc, address, size, user_data):
+        """For Debugging Use Only"""
+        print('>>> Tracing instruction at 0x%x, instruction size = 0x%x' % (address, size))
+
+    def hook_call(self, uc, address, size, user_data):
+        """For Debugging Use Only"""
+        print('>>> Call instruction at 0x%x, instruction size = 0x%x' % (address, size))
+
+    def hook_mem_invalid(self, uc, access, address, size, value, user_data):
+     """For Debugging Use Only"""
+        eip = uc.reg_read(UC_X86_REG_EIP)
+        if access == UC_MEM_WRITE:
+            print("invalid WRITE of 0x%x at 0x%X, data size = %u, data value = 0x%x" % (address, eip, size, value))
+        if access == UC_MEM_READ:
+            print("invalid READ of 0x%x at 0x%X, data size = %u" % (address, eip, size))
+        if access == UC_MEM_FETCH:
+            print("UC_MEM_FETCH of 0x%x at 0x%X, data size = %u" % (address, eip, size))
+        if access == UC_MEM_READ_UNMAPPED:
+            print("UC_MEM_READ_UNMAPPED of 0x%x at 0x%X, data size = %u" % (address, eip, size))
+        if access == UC_MEM_WRITE_UNMAPPED:
+            print("UC_MEM_WRITE_UNMAPPED of 0x%x at 0x%X, data size = %u" % (address, eip, size))
+        if access == UC_MEM_FETCH_UNMAPPED:
+            print("UC_MEM_FETCH_UNMAPPED of 0x%x at 0x%X, data size = %u" % (address, eip, size))
+        if access == UC_MEM_WRITE_PROT:
+            print("UC_MEM_WRITE_PROT of 0x%x at 0x%X, data size = %u" % (address, eip, size))
+        if access == UC_MEM_FETCH_PROT:
+            print("UC_MEM_FETCH_PROT of 0x%x at 0x%X, data size = %u" % (address, eip, size))
+        if access == UC_MEM_FETCH_PROT:
+            print("UC_MEM_FETCH_PROT of 0x%x at 0x%X, data size = %u" % (address, eip, size))
+        if access == UC_MEM_READ_AFTER:
+            print("UC_MEM_READ_AFTER of 0x%x at 0x%X, data size = %u" % (address, eip, size))
+        return False
 ```
+
+
 
 ## References
  - https://manybutfinite.com/post/journey-to-the-stack/
